@@ -1,5 +1,5 @@
 name: GitHub-hosted build
-# trigger: dependency fix bbe7f117
+# trigger: restore SDK bootstrap 72ec6e1b
 
 on:
   workflow_dispatch:
