@@ -16,33 +16,16 @@ printf '#!/bin/sh\nexec /usr/bin/ninja -j24 "$@"\n' > "$root/build/radv-tools/ni
 chmod +x "$root/build/radv-tools/ninja"
 export NINJA="$root/build/radv-tools/ninja"
 command -v ccache >/dev/null
-# GitHub-hosted Ubuntu can have several LLVM-SPIRV pkg-config files installed.
-# Mesa 26 requires LLVMSPIRVLib >= 22.1, so prefer the v22 metadata explicitly.
-llvm_spirv_pc=$(dpkg -L libllvmspirvlib-22-dev 2>/dev/null | grep '/LLVMSPIRVLib\.pc# Cross compilers do not get Meson's automatic native ccache detection.
-# Keep this two-line build-only adaptation reproducible on a fresh checkout.
-python3 - "$vulkan/tooling/radv/ps5-cross.ini" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-s = p.read_text()
-for lang, compiler in [('c', 'prospero-clang'), ('cpp', 'prospero-clang++')]:
-    plain = f"{lang} = sdk / 'bin/{compiler}'"
-    cached = f"{lang} = ['ccache', sdk / 'bin/{compiler}']"
-    assert plain in s or cached in s, 'Unexpected upstream cross compiler configuration'
-    s = s.replace(plain, cached)
-p.write_text(s)
-PY
-bash "$vulkan/tools/setup-native-dependencies.sh"
-bash "$vulkan/tools/build-radv.sh" release
-python3 "$root/tools/patch-radv-wsi.py"
-bash "$vulkan/tools/build-radv.sh" release
-sha256sum "$vulkan/.deps/work/radv-src/src/vulkan/wsi/wsi_common_videoout.c" \
-    > "$vulkan/.deps/native/radv-release/EDEN_WSI_SHA256"
- | head -n1 || true)
-if [[ -n $llvm_spirv_pc ]]; then
+
+# GitHub-hosted Ubuntu can expose multiple LLVM-SPIRV pkg-config versions.
+# Mesa 26 requires LLVMSPIRVLib >= 22.1, so prefer v22 explicitly when installed.
+llvm_spirv_pc=$(dpkg -L libllvmspirvlib-22-dev 2>/dev/null | grep '/LLVMSPIRVLib\.pc$' | head -n1 || true)
+if [[ -n "$llvm_spirv_pc" ]]; then
     export PKG_CONFIG_PATH="$(dirname "$llvm_spirv_pc"):${PKG_CONFIG_PATH:-}"
-    echo "Using LLVM-SPIRV pkg-config: $llvm_spirv_pc ($(pkg-config --modversion LLVMSPIRVLib))"
+    echo "Using LLVM-SPIRV pkg-config: $llvm_spirv_pc"
+    pkg-config --modversion LLVMSPIRVLib
 fi
+
 # Cross compilers do not get Meson's automatic native ccache detection.
 # Keep this two-line build-only adaptation reproducible on a fresh checkout.
 python3 - "$vulkan/tooling/radv/ps5-cross.ini" <<'PY'
