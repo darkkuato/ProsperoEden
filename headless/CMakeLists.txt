@@ -291,6 +291,34 @@ list(FILTER jit_sources EXCLUDE REGEX "(^|/)a64_translate\\.cpp$")
 set_property(TARGET dynarmic PROPERTY SOURCES "${jit_sources}")
 target_sources(dynarmic PRIVATE "${PORT_BUILD_DIR}/a64_translate.cpp")
 
+# Decoder tables: upstream fills 4096 lists and, for each list, parses the bit string of every
+# instruction pattern again (~640 for A64, ~260 for A32): about half a second in the first block
+# a game compiles, on the guest core that asked for it. Parse every pattern once, then fill the
+# lists from that, in the same order (tools/check-decoder-startup.py).
+foreach(decoder IN ITEMS "A64/decoder/a64" "A32/decoder/arm")
+    set(decoder_source "${PROJECT_SOURCE_DIR}/src/dynarmic/src/dynarmic/frontend/${decoder}")
+    file(READ "${decoder_source}.h" decoder_header)
+    get_filename_component(decoder_name "${decoder}" NAME)
+    set(decoder_loop "        for (size_t i = 0; i < t.size(); ++i) {\n#define INST")
+    set(decoder_match "        if ((i & make_fast_index(mask)) == make_fast_index(expect)) { \\\n            t[i].emplace_back(")
+    set(decoder_end "#include \"./${decoder_name}.inc\"\n#undef INST\n        }\n        return t;")
+    foreach(anchor IN ITEMS decoder_loop decoder_match decoder_end)
+        string(FIND "${decoder_header}" "${${anchor}}" offset)
+        if(offset LESS 0)
+            message(FATAL_ERROR "Pinned ${decoder_name} decoder table changed (${anchor})")
+        endif()
+    endforeach()
+    string(REPLACE "${decoder_loop}" "        std::vector<Handler> all;\n        {\n#define INST" decoder_header "${decoder_header}")
+    string(REPLACE "${decoder_match}" "        { \\\n            all.emplace_back(" decoder_header "${decoder_header}")
+    string(REPLACE "${decoder_end}" "#include \"${decoder_source}.inc\"\n#undef INST\n        }\n        for (size_t i = 0; i < t.size(); ++i)\n            for (auto const& e : all)\n                if ((i & make_fast_index(e.mask)) == make_fast_index(e.expect))\n                    t[i].push_back(e);\n        return t;" decoder_header "${decoder_header}")
+    # The other use of the pattern list in the header (the instruction's name).
+    string(REPLACE "#include \"./${decoder_name}.inc\"" "#include \"${decoder_source}.inc\"" decoder_header "${decoder_header}")
+    write_derived("${PORT_BUILD_DIR}/include/dynarmic/frontend/${decoder}.h" "${decoder_header}")
+endforeach()
+# The override headers shadow upstream's only by include order: a definition on the target
+# recompiles every dynarmic object that saw the upstream ones.
+target_compile_definitions(dynarmic PRIVATE EDEN_DECODER_ONE_PARSE=1)
+
 # Cancel low-lane extraction of a scalar that was just zero-extended to Q.
 # Preserve other lanes, arbitrary vectors and all floating-point operations.
 file(READ "${PROJECT_SOURCE_DIR}/src/dynarmic/src/dynarmic/ir/opt_passes.cpp" optimizer)
@@ -847,6 +875,19 @@ if(EDEN_A32_FASTMEM)
     list(REMOVE_ITEM core_sources "loader/deconstructed_rom_directory.cpp")
     list(APPEND core_sources "${PORT_BUILD_DIR}/deconstructed_rom_directory.cpp")
 endif()
+# GetPseudoDeviceId read the seed through the control data without checking that there is
+# any (a game without control data, such as a homebrew NRO): seed 0 then, as for other
+# NACP fields Eden defaults when the metadata is missing.
+file(READ "${PROJECT_SOURCE_DIR}/src/core/hle/service/am/service/application_functions.cpp" app_functions_source)
+set(app_functions_old "    auto const seed = res.first->raw.seed_for_pseudo_device_id;")
+string(FIND "${app_functions_source}" "${app_functions_old}" app_functions_at)
+if(app_functions_at LESS 0)
+    message(FATAL_ERROR "Pinned GetPseudoDeviceId changed")
+endif()
+string(REPLACE "${app_functions_old}" "    auto const seed = res.first != nullptr ? res.first->raw.seed_for_pseudo_device_id : u64_le{0};" app_functions_source "${app_functions_source}")
+write_derived("${PORT_BUILD_DIR}/application_functions.cpp" "${app_functions_source}")
+list(REMOVE_ITEM core_sources "hle/service/am/service/application_functions.cpp")
+list(APPEND core_sources "${PORT_BUILD_DIR}/application_functions.cpp")
 set_property(TARGET core PROPERTY SOURCES "${core_sources}")
 # Core's NS query service owns this implementation from frontend_common.
 target_sources(core PRIVATE "${PROJECT_SOURCE_DIR}/src/frontend_common/play_time_manager.cpp")
@@ -868,6 +909,17 @@ if(audio_shutdown_offset LESS 0)
 endif()
 string(REPLACE "${old_audio_shutdown}"
     "        if (audio_core) audio_core->Shutdown();\n${old_audio_shutdown}" system_source "${system_source}")
+# The cheat engine's looping timing event reads HID through the service manager; it was
+# destroyed after the services, and core timing runs again during their teardown
+# (SyncPause(false)), so a game with cheats crashed on the HostTiming thread when stopped.
+# Its destructor unschedules the event and waits for a callback in progress.
+set(old_cheat_shutdown "        kernel.CloseServices();")
+string(FIND "${system_source}" "${old_cheat_shutdown}" cheat_shutdown_offset)
+if(cheat_shutdown_offset LESS 0)
+    message(FATAL_ERROR "Pinned service shutdown changed; review cheat engine lifetime.")
+endif()
+string(REPLACE "${old_cheat_shutdown}"
+    "        cheat_engine.reset();\n${old_cheat_shutdown}" system_source "${system_source}")
 # Kernel intrusive lists refer into DeviceMemory even during failed Load unwind.
 # Declare the backing first so reverse member destruction releases it last.
 string(REPLACE "    std::optional<Core::DeviceMemory> device_memory;\n" "" system_source "${system_source}")
@@ -1076,6 +1128,13 @@ eden_patch(patch_source
     "const auto this_build_id = fmt::format(\"{:0<64}\", Common::ToUpper(name.substr(0, name.find('.'))));")
 # A game without a mods folder is the usual case here, not an error to log for each of its modules.
 eden_patch(patch_source "        LOG_ERROR(Loader, \"Cannot load mods for invalid title_id={:016X}\", title_id);\n" "")
+# Cheats chosen one by one (headless/cheats.h): each mod's cheat list, from its folder or from a
+# loose cheat file, goes into the game's with the cheats that were not chosen switched off.
+eden_patch(patch_source "std::copy(res->begin(), res->end(), std::back_inserter(out));"
+    "Eden::Cheats::Append(out, *res, subdir->GetName());")
+eden_patch(patch_source "std::copy(res.begin(), res.end(), std::back_inserter(out));"
+    "Eden::Cheats::Append(out, res, name);")
+string(PREPEND patch_source "#include \"${EDEN_PORT_DIR}/cheats.h\"\n")
 write_derived("${PORT_BUILD_DIR}/patch_manager.cpp" "${patch_source}")
 get_target_property(core_sources core SOURCES)
 list(REMOVE_ITEM core_sources file_sys/ips_layer.cpp file_sys/patch_manager.cpp)
@@ -2053,7 +2112,7 @@ void Initialize() {
     endif()
     add_executable(eden-headless "${EDEN_PORT_DIR}/main.cpp" "${PORT_ROOT}/src/aligned_alloc.c"
         "${EDEN_PORT_DIR}/heap_pages.cpp" "${EDEN_PORT_DIR}/performance.cpp"
-        "${EDEN_PORT_DIR}/crash_report.cpp"
+        "${EDEN_PORT_DIR}/crash_report.cpp" "${EDEN_PORT_DIR}/stop_limit.cpp"
         "${EDEN_PORT_DIR}/elevation/elevation.cpp"
         "${eden_app_crt}" "${PORT_ROOT}/src/lifecycle.c"
         "${PORT_BUILD_DIR}/app_heap.c")
@@ -2068,7 +2127,8 @@ void Initialize() {
     endif()
     target_compile_definitions(common PRIVATE PS5_NATIVE=1)
 else()
-    add_executable(eden-headless "${EDEN_PORT_DIR}/main.cpp" "${PORT_ROOT}/src/aligned_alloc.c")
+    add_executable(eden-headless "${EDEN_PORT_DIR}/main.cpp" "${PORT_ROOT}/src/aligned_alloc.c"
+        "${EDEN_PORT_DIR}/stop_limit.cpp")
     target_link_options(eden-headless PRIVATE -Wl,--wrap=aligned_alloc)
     add_executable(eden-romfs-check "${EDEN_PORT_DIR}/romfs_check.cpp")
     target_include_directories(eden-romfs-check PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -2090,11 +2150,34 @@ else()
     add_executable(eden-settings-check "${EDEN_PORT_DIR}/preferences_check.cpp")
     target_link_libraries(eden-settings-check PRIVATE core)
     target_compile_options(eden-settings-check PRIVATE -UNDEBUG)
+    # So is the check of the cheat files' entries (patch_library.h).
+    add_executable(eden-patch-library-check "${EDEN_PORT_DIR}/patch_library_check.cpp")
+    target_compile_options(eden-patch-library-check PRIVATE -UNDEBUG)
     add_executable(eden-devices-check "${EDEN_PORT_DIR}/devices_check.cpp")
     target_link_libraries(eden-devices-check PRIVATE core eden-pad eden-device-mock)
     target_compile_options(eden-devices-check PRIVATE -fno-rtti)
+    # The player profiles (profiles.h): Eden's profile file and the choice in the settings file.
+    add_executable(eden-profiles-check "${EDEN_PORT_DIR}/profiles_check.cpp")
+    target_link_libraries(eden-profiles-check PRIVATE core)
+    target_compile_options(eden-profiles-check PRIVATE -UNDEBUG)
+    # The update check's decision, without its network side (update_notice.h).
+    add_executable(eden-update-check
+        "${EDEN_PORT_DIR}/update_check_check.cpp" "${EDEN_PORT_DIR}/update_check/update_check.c")
+    target_compile_definitions(eden-update-check PRIVATE UPDATE_CHECK_NO_NETWORK=1)
+    target_compile_options(eden-update-check PRIVATE -UNDEBUG)
 endif()
 target_include_directories(eden-headless PRIVATE "${PROJECT_SOURCE_DIR}/src")
+# The app version has one home, sce_sys/param.json (contentVersion), which the package carries as
+# it is. A header of its own, so a new version recompiles only the two files that show it.
+file(READ "${PORT_ROOT}/sce_sys/param.json" app_param)
+string(JSON app_version GET "${app_param}" contentVersion)
+if(NOT app_version MATCHES "^[0-9][0-9]\\.[0-9][0-9][0-9]\\.[0-9][0-9][0-9]$")
+    message(FATAL_ERROR "sce_sys/param.json: contentVersion must be NN.NNN.NNN, not '${app_version}'")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PORT_ROOT}/sce_sys/param.json")
+write_derived("${PORT_BUILD_DIR}/version/app_version.h"
+    "// Generated from sce_sys/param.json (contentVersion).\n#pragma once\n#define EDEN_APP_VERSION \"${app_version}\"\n")
+target_include_directories(eden-headless PRIVATE "${PORT_BUILD_DIR}/version")
 target_link_libraries(eden-headless PRIVATE core eden-pad)
 add_library(eden-metadata STATIC "${EDEN_PORT_DIR}/metadata_bridge.cpp")
 target_include_directories(eden-metadata PUBLIC "${EDEN_PORT_DIR}" PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -2216,6 +2299,9 @@ endif()
                 "${launcher_dir}/pe/platform/audio_out.cpp"
                 "${launcher_dir}/pe/platform/display_egl.cpp"
                 "${launcher_dir}/pe/ui/browse.cpp"
+                "${launcher_dir}/pe/ui/game_options.cpp"
+                "${launcher_dir}/pe/ui/profiles.cpp"
+                "${launcher_dir}/pe/ui/update.cpp"
                 "${launcher_dir}/pe/ui/home.cpp"
                 "${launcher_dir}/pe/ui/launcher.cpp"
                 "${launcher_dir}/pe/ui/library.cpp"
@@ -2223,6 +2309,60 @@ endif()
                 "${launcher_dir}/pe/ui/textures.cpp"
                 "${launcher_dir}/pe/ui/widgets.cpp")
             target_sources(eden-headless PRIVATE ${launcher_sources})
+            # The update check (update_notice.h). Its network side is the boilerplate's
+            # update_check.c and console_curl.c with libcurl and libpsl from the pinned PacBrew
+            # prefix that already supplies OpenSSL and zlib (zstd is Eden's own). They are linked
+            # into one object first, and what console_curl.c puts in place of libc for libcurl
+            # (name lookup, fcntl on sockets, a few more functions) gets a name of its own there
+            # (console_curl_getaddrinfo, ...): the emulator's network and file code keeps the
+            # functions it had, so the update check changes nothing else. The boilerplate wraps
+            # fcntl for the whole program (--wrap=fcntl); here only this object's calls go
+            # through the wrapper.
+            get_filename_component(update_libraries "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+            if(NOT EXISTS "${update_libraries}/libcurl.a" OR NOT EXISTS "${update_libraries}/libpsl.a")
+                message(FATAL_ERROR "libcurl is missing from the PacBrew prefix (${update_libraries}): run make deps")
+            endif()
+            find_program(UPDATE_CHECK_LINKER NAMES ld.lld-18 ld.lld REQUIRED)
+            find_program(UPDATE_CHECK_OBJCOPY NAMES llvm-objcopy-18 llvm-objcopy REQUIRED)
+            add_library(update-check OBJECT
+                "${EDEN_PORT_DIR}/update_check/update_check.c"
+                "${EDEN_PORT_DIR}/update_check/console_curl.c"
+                "${EDEN_PORT_DIR}/update_check/self_update.c"
+                "${EDEN_PORT_DIR}/update_check/self_update_ps5.c"
+                "${EDEN_PORT_DIR}/update_check/self_update_sha256.c")
+            target_include_directories(update-check PRIVATE "${OPENSSL_INCLUDE_DIR}")
+            # The kit's paths are the app's own: after elevation /app0 and /download0 are gone
+            # (update_notice.cpp gives them).
+            target_compile_definitions(update-check PRIVATE CURL_STATICLIB=1
+                "SELF_UPDATE_HELPER_PATH=eden_self_update_path(0)"
+                "SELF_UPDATE_PARAM_PATH=eden_self_update_path(1)"
+                "SELF_UPDATE_SEQUENCE_PATH=eden_self_update_path(2)")
+            set_source_files_properties("${EDEN_PORT_DIR}/update_check/self_update_ps5.c"
+                PROPERTIES COMPILE_OPTIONS "-include;${EDEN_PORT_DIR}/update_check/eden_paths.h")
+            # Every function console_curl.c defines under a libc name.
+            set(update_own
+                getaddrinfo freeaddrinfo gai_strerror gethostbyname getnameinfo fnmatch getpwuid_r
+                _setjmp _longjmp openlog closelog dladdr if_nametoindex pipe2 recvmmsg sendmmsg
+                popen pclose isatty mkstemp gmtime_r ZSTD_trace_compress_begin
+                ZSTD_trace_compress_end ZSTD_trace_decompress_begin ZSTD_trace_decompress_end)
+            set(update_rename --redefine-sym fcntl=__wrap_fcntl --redefine-sym __real_fcntl=fcntl)
+            foreach(name IN LISTS update_own)
+                list(APPEND update_rename --redefine-sym "${name}=console_curl_${name}")
+            endforeach()
+            set(update_object "${CMAKE_CURRENT_BINARY_DIR}/update-check.o")
+            add_custom_command(OUTPUT "${update_object}"
+                COMMAND "${UPDATE_CHECK_LINKER}" -r -o "${update_object}.all"
+                    "$<TARGET_OBJECTS:update-check>"
+                    "${update_libraries}/libcurl.a" "${update_libraries}/libpsl.a"
+                COMMAND "${UPDATE_CHECK_OBJCOPY}" ${update_rename}
+                    "${update_object}.all" "${update_object}"
+                DEPENDS update-check "$<TARGET_OBJECTS:update-check>"
+                    "${update_libraries}/libcurl.a" "${update_libraries}/libpsl.a"
+                COMMAND_EXPAND_LISTS VERBATIM)
+            set_source_files_properties("${update_object}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+            target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/update_notice.cpp" "${update_object}")
+            target_link_libraries(eden-headless PRIVATE
+                "${OPENSSL_SSL_LIBRARY}" "${OPENSSL_CRYPTO_LIBRARY}" "${ZLIB_LIBRARY}")
             # The launcher calls OpenGL by name (the SDK's headers), not through glad.
             set(launcher_definitions "GL_GLEXT_PROTOTYPES=1")
             if(EXISTS "${EDEN_PORT_DIR}/ryujinx_saves.h")

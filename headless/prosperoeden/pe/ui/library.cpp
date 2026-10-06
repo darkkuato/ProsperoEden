@@ -30,13 +30,15 @@ constexpr Rect kModsRow{1022.0f, 782.0f, 736.0f, 74.0f};
 constexpr Rect kDialog{550.0f, 180.0f, 820.0f, 720.0f};
 
 // The game settings dialog's rows, and the window that shows five of them (also the Mods list's).
+// Video to Language open what the game does differently from Settings (game_options.cpp).
 enum GameRow : int
 {
     row_mode,
-    row_renderer,
-    row_resolution,
-    row_filter,
-    row_refresh,
+    row_video,
+    row_performance,
+    row_audio,
+    row_controls,
+    row_language,
     row_mods,
     row_save, // in builds that move saves
 };
@@ -141,6 +143,51 @@ void Launcher::read_home()
         std::count_if(mods.begin(), mods.end(), [](const Mod &mod) { return mod.enabled; }));
 }
 
+void Launcher::check_games_present()
+{
+    // The home screen: its game, or one of its recent ones, is gone. Its focus stays where it can.
+    if (screen_ == Screen::home && modal_ == Modal::none)
+    {
+        bool gone = home_.last_exists && !services_.game_exists(home_.last_file);
+        for (const Recent &recent : home_.recents)
+            gone = gone || !services_.game_exists(recent.file);
+        if (gone)
+        {
+            read_home();
+            const int recents = static_cast<int>(home_.recents.size());
+            if (home_focus_ >= 5 && home_focus_ < 9 && home_focus_ - 5 >= recents)
+                home_focus_ = recents > 0 ? 4 + recents : 9;
+            if (home_focus_ == 4 && !home_.last_exists)
+                home_focus_ = 0;
+        }
+    }
+    // The Library's list, whatever screen shows: a game's own dialogs stay with their game.
+    if (modal_ == Modal::none)
+        drop_missing_games();
+}
+
+bool Launcher::drop_missing_games()
+{
+    if (!games_loaded_)
+        return false;
+    const std::string selected =
+        library_.selected < static_cast<int>(games_.size()) ? games_[static_cast<std::size_t>(library_.selected)].file :
+                                                              std::string{};
+    const auto gone = std::remove_if(games_.begin(), games_.end(),
+                                     [this](const Game &game) { return !services_.game_exists(game.file); });
+    if (gone == games_.end())
+        return false;
+    games_.erase(gone, games_.end());
+    // The selection stays on its game, or on the one that took its place.
+    int index = std::min(library_.selected, std::max(0, static_cast<int>(games_.size()) - 1));
+    for (int i = 0; i < static_cast<int>(games_.size()); ++i)
+        if (games_[static_cast<std::size_t>(i)].file == selected)
+            index = i;
+    library_.reset(static_cast<int>(games_.size()), index);
+    refresh_selected_game();
+    return true;
+}
+
 void Launcher::count_mods(Game &game, const std::vector<Mod> &mods)
 {
     game.mods = static_cast<int>(mods.size());
@@ -154,6 +201,20 @@ void Launcher::count_mods(Game &game, const std::vector<Mod> &mods)
     {
         home_.last_mods = game.mods;
         home_.last_mods_on = game.mods_on;
+    }
+}
+
+void Launcher::read_mods(Game &game)
+{
+    mods_ = services_.mods(game.title_id);
+    count_mods(game, mods_);
+    mod_list_.clear();
+    for (int mod = 0; mod < static_cast<int>(mods_.size()); ++mod)
+    {
+        mod_list_.push_back({mod, -1});
+        for (int cheat = 0; cheat < static_cast<int>(mods_[static_cast<std::size_t>(mod)].cheats.size());
+             ++cheat)
+            mod_list_.push_back({mod, cheat});
     }
 }
 
@@ -183,8 +244,10 @@ void Launcher::enter_library()
 {
     if (games_loaded_)
     {
-        // Games copied to the console since the list was read appear in a moment.
+        // Games copied to the console since the list was read appear in a moment; games taken
+        // away leave it at once.
         finish_scan(false);
+        drop_missing_games();
         start_scan();
     }
     else
@@ -293,8 +356,7 @@ void Launcher::press_library(Key key)
         import_source_ = services_.save_transfer_available() ?
                              services_.save_import_source(game->title_id) : SaveSource::none;
         import_armed_ = false;
-        mods_ = services_.mods(game->title_id);
-        count_mods(games_[static_cast<std::size_t>(library_.selected)], mods_);
+        read_mods(games_[static_cast<std::size_t>(library_.selected)]);
         open_modal(Modal::game);
         game_rows_.visible = kDialogRowsShown;
         game_rows_.pitch = kDialogRowPitch;
@@ -483,7 +545,8 @@ void Launcher::draw_library(Canvas &c)
     }
     draw_pad(c, Pad::leftright, 1022.0f, 876.0f, 26.0f);
     // A message said while Game settings is open belongs to that dialog.
-    const bool said = !message_.empty() && modal_shown_ != Modal::game && modal_shown_ != Modal::mods;
+    const bool said = !message_.empty() && modal_shown_ != Modal::game && modal_shown_ != Modal::mods &&
+                      modal_shown_ != Modal::game_options && modal_shown_ != Modal::mapping;
     const std::string hint = said ? message_ :
                              can_configure ? tr("Change mode. Saved per game.") :
                                              tr("Select a readable game to configure its mode.");
@@ -532,17 +595,23 @@ void Launcher::press_game(Key key)
     default:
         return;
     }
+    if (option_ >= row_video && option_ <= row_language)
+    {
+        // A kind of setting has its own list.
+        if (key == Key::cross)
+            open_game_options(option_ - row_video);
+        return;
+    }
     if (option_ == row_mods)
     {
         // The game's mods have their own list. It is read again: mods may have been copied in
         // since this dialog opened.
         if (key != Key::cross)
             return;
-        mods_ = services_.mods(game.title_id);
-        count_mods(game, mods_);
+        read_mods(game);
         mod_rows_.visible = kDialogRowsShown;
         mod_rows_.pitch = kDialogRowPitch;
-        mod_rows_.reset(static_cast<int>(mods_.size()), 0);
+        mod_rows_.reset(static_cast<int>(mod_list_.size()), 0);
         modal_ = modal_shown_ = Modal::mods;
         message_.clear();
         cue(Cue::open);
@@ -580,38 +649,11 @@ void Launcher::press_game(Key key)
         }
         return;
     }
-    const int step = key == Key::left ? -1 : 1;
-    bool saved = false;
-    if (option_ == row_mode)
-    {
-        saved = services_.set_docked(game.title_id, !game_docked_);
-        if (saved)
-            game_docked_ = !game_docked_;
-    }
-    else
-    {
-        // Default (-1), then each value.
-        const auto cycle = [step](int value, int count)
-        { return (value + 1 + step + count + 1) % (count + 1) - 1; };
-        GameSettings next = game_settings_;
-        if (option_ == row_renderer)
-            next.renderer = cycle(next.renderer, 2);
-        if (option_ == row_resolution)
-            next.resolution =
-                cycle(next.resolution, static_cast<int>(services_.resolution_labels().size()));
-        if (option_ == row_filter)
-            next.filter = cycle(next.filter, static_cast<int>(services_.filter_labels().size()));
-        if (option_ == row_refresh)
-            next.refresh = cycle(next.refresh, 2);
-        saved = services_.set_game_settings(game.title_id, next);
-        if (saved)
-            game_settings_ = next;
-    }
-    // 120 Hz is a request: the display has the last word.
-    const bool fast = saved && option_ == row_refresh &&
-                      (game_settings_.refresh >= 0 ? game_settings_.refresh : prefs_.refresh) == 1;
-    say(fast ? tr("Saved. A display that cannot show 120 Hz stays at 60 Hz.") :
-        saved ? tr("Saved for this game. Applies on next launch.") : tr("Could not save. Please try again."),
+    // The console mode.
+    const bool saved = services_.set_docked(game.title_id, !game_docked_);
+    if (saved)
+        game_docked_ = !game_docked_;
+    say(saved ? tr("Saved for this game. Applies on next launch.") : tr("Could not save. Please try again."),
         !saved);
     cue(saved ? Cue::toggle : Cue::error);
 }
@@ -630,27 +672,20 @@ void Launcher::draw_game(Canvas &c, float open)
     text_fit(c, game != nullptr ? game->name : std::string{}, 592.0f,
              baseline(291.0f, 32.0f, theme::kSmall), theme::kSmall, Color::rgb(0xbecbb9), 736.0f);
 
-    static constexpr const char *kRenderers[] = {"OpenGL", "Vulkan"};
-    const auto &resolutions = services_.resolution_labels();
-    // A resolution's short name is how its label starts: "0.5x (faster, softer)" is "0.5x".
-    const auto short_resolution = [](const std::string &label)
-    { return label.substr(0, label.find(' ')); };
-    const auto &filters = services_.filter_labels();
-    const auto pick = [](const std::vector<std::string> &values, int index) -> std::string
+    // A kind of setting: what the game does differently from Settings, if anything.
+    const auto changed = [this](int category)
     {
-        return index >= 0 && index < static_cast<int>(values.size()) ?
-                   values[static_cast<std::size_t>(index)] : std::string{"-"};
+        const int count = game_overrides(category);
+        return count == 0 ? std::string{tr("Follows Settings")} :
+                            fill(tr("{0} changed"), {std::to_string(count)});
     };
     const std::string values[] = {
         game_docked_ ? tr("Docked") : tr("Handheld"),
-        game_settings_.renderer >= 0 ? kRenderers[game_settings_.renderer] :
-            fill(tr("Default ({0})"), {kRenderers[prefs_.renderer != 0 ? 1 : 0]}),
-        game_settings_.resolution >= 0 ? pick(resolutions, game_settings_.resolution) :
-            fill(tr("Default ({0})"), {short_resolution(pick(resolutions, prefs_.resolution))}),
-        game_settings_.filter >= 0 ? pick(filters, game_settings_.filter) :
-            fill(tr("Default ({0})"), {pick(filters, prefs_.filter)}),
-        game_settings_.refresh >= 0 ? hertz(game_settings_.refresh) :
-            fill(tr("Default ({0})"), {hertz(prefs_.refresh)}),
+        changed(row_video - row_video),
+        changed(row_performance - row_video),
+        changed(row_audio - row_video),
+        changed(row_controls - row_video),
+        changed(row_language - row_video),
         // With the game's Mods switch off (the Library's), none of them is on.
         mods_.empty() ? std::string{tr("No mods")} :
         game != nullptr && !game->mods_enabled ? std::string{tr("Off")} :
@@ -661,9 +696,9 @@ void Launcher::draw_game(Canvas &c, float open)
         import_source_ == SaveSource::ryujinx ? tr("Ryujinx save found") :
         import_source_ == SaveSource::folder ? tr("Save folder found") : tr("Nothing to import"),
     };
-    static constexpr const char *kLabels[] = {TR("Console mode"), TR("Renderer"), TR("Resolution"),
-                                              TR("Upscaling filter"), TR("Refresh rate"),
-                                              TR("Mods"), TR("Save data")};
+    static constexpr const char *kLabels[] = {TR("Console mode"), TR("Video"),    TR("Performance"),
+                                              TR("Audio"),        TR("Controls"), TR("Language"),
+                                              TR("Mods"),         TR("Save data")};
     // Five rows show; the list scrolls to the others.
     list.push_clip({kDialogWindow.x - 24.0f, kDialogWindow.y - 6.0f, kDialogWindow.w + 48.0f,
                     kDialogWindow.h + 12.0f});
@@ -684,12 +719,13 @@ void Launcher::draw_game(Canvas &c, float open)
         const float top = row_top(row);
         const float focus = row == option_ ? 1.0f : 0.0f;
         list.push_opacity(game_rows_.row_alpha(row, kDialogRowHeight));
-        // The value first: the row's name takes what it leaves. Mods and Save data say what is
-        // there; the others are choices.
+        // The value first: the row's name takes what it leaves. The kinds of setting, Mods and
+        // Save data say what is there; the console mode is a choice.
         const bool there = row == row_mods ? !mods_.empty() && (game == nullptr || game->mods_enabled) :
-                                             import_source_ != SaveSource::none;
+                           row == row_save ? import_source_ != SaveSource::none :
+                                             game_overrides(row - row_video) > 0;
         const float taken =
-            row >= row_mods ?
+            row != row_mode ?
                 text_shrink(c, values[row], 1292.0f, baseline(top, kDialogRowHeight, theme::kSmall),
                             theme::kSmall, there ? theme::kLimePale : theme::kMeta, 320.0f,
                             Align::right) :
@@ -716,7 +752,7 @@ void Launcher::draw_game(Canvas &c, float open)
                                              {Pad::circle, TR("Back")}};
         draw_hints(c, kTransfer, 3, 592.0f, kDialogHints, theme::kCopy, 736.0f);
     }
-    else if (option_ == row_mods)
+    else if (option_ != row_mode)
     {
         static constexpr Hint kOpen[] = {{Pad::cross, TR("Open")}, {Pad::circle, TR("Back")}};
         draw_hints(c, kOpen, 2, 592.0f, kDialogHints, theme::kCopy, 736.0f);
@@ -771,10 +807,31 @@ void Launcher::press_mods(Key key)
     {
         if (mods_.empty())
             return;
-        Mod &mod = mods_[static_cast<std::size_t>(mod_rows_.selected)];
+        const ModRow at = mod_list_[static_cast<std::size_t>(mod_rows_.selected)];
+        Mod &mod = mods_[static_cast<std::size_t>(at.mod)];
         // With the game's Mods switch off (the Library's), choosing a mod turns the switch on and
         // that mod with it: nobody switches a mod in a list that is switched off.
         const bool revive = !game.mods_enabled;
+        if (at.cheat >= 0)
+        {
+            // One of the mod's cheats. Choosing it turns on what it runs behind: its mod, and the
+            // game's Mods switch. One of a group (two frame rates) takes the other's place, so
+            // the list is read again.
+            const Cheat &cheat = mod.cheats[static_cast<std::size_t>(at.cheat)];
+            const bool enabled = revive || !mod.enabled || !cheat.enabled;
+            const bool saved =
+                (!revive || services_.set_mods_enabled(game.title_id, true)) &&
+                (mod.enabled || services_.set_mod_enabled(game.title_id, mod.name, true)) &&
+                services_.set_cheat_enabled(game.title_id, mod.name, cheat.name, enabled);
+            read_mods(game);
+            if (mod_rows_.count != static_cast<int>(mod_list_.size()))
+                mod_rows_.reset(static_cast<int>(mod_list_.size()), 0);
+            say(saved ? tr("Saved for this game. Applies on next launch.") :
+                        tr("Could not save. Please try again."),
+                !saved);
+            cue(saved ? Cue::toggle : Cue::error);
+            return;
+        }
         const bool enabled = revive || !mod.enabled;
         const bool saved = (!revive || services_.set_mods_enabled(game.title_id, true)) &&
                            services_.set_mod_enabled(game.title_id, mod.name, enabled);
@@ -835,13 +892,37 @@ void Launcher::draw_mods(Canvas &c, float open)
         const bool live = game == nullptr || game->mods_enabled;
         for (int row = mod_rows_.first_row(); row <= mod_rows_.last_row(); ++row)
         {
-            const Mod &mod = mods_[static_cast<std::size_t>(row)];
+            const ModRow at = mod_list_[static_cast<std::size_t>(row)];
+            const Mod &mod = mods_[static_cast<std::size_t>(at.mod)];
             const float top = row_top(row);
             list.push_opacity(mod_rows_.row_alpha(row, kDialogRowHeight));
-            // Its name as the player's folder has it, what it changes under it, its switch.
+            if (at.cheat >= 0)
+            {
+                // One of the mod's cheats, set in under it, with its own switch: faint while its
+                // mod is off.
+                const Cheat &cheat = mod.cheats[static_cast<std::size_t>(at.cheat)];
+                const bool used = live && mod.enabled;
+                text_fit(c, cheat.name, 668.0f,
+                         baseline(top + (kDialogRowHeight - 38.0f) * 0.5f, 38.0f, theme::kText24),
+                         theme::kText24, cheat.enabled && used ? theme::kValue : theme::kMeta, 520.0f);
+                list.push_opacity(used ? 1.0f : 0.4f);
+                toggle(c, 1292.0f, top + kDialogRowHeight * 0.5f, cheat.enabled ? 1.0f : 0.0f);
+                list.pop_opacity();
+                list.pop_opacity();
+                continue;
+            }
+            // Its name as the player's folder has it, what it changes under it (with how many of
+            // its cheats are chosen when it lists several), its switch.
+            std::string kind = mod.kind;
+            if (!mod.cheats.empty())
+                kind += ", " + fill(tr("{0} of {1} on"),
+                                    {std::to_string(std::count_if(
+                                         mod.cheats.begin(), mod.cheats.end(),
+                                         [](const Cheat &cheat) { return cheat.enabled; })),
+                                     std::to_string(mod.cheats.size())});
             text_fit(c, mod.name, 628.0f, baseline(top + 14.0f, 38.0f, theme::kText24),
                      theme::kText24, mod.enabled && live ? theme::kValue : theme::kMeta, 560.0f);
-            text_shrink(c, mod.kind, 628.0f, baseline(top + 52.0f, 28.0f, theme::kSmall),
+            text_shrink(c, kind, 628.0f, baseline(top + 52.0f, 28.0f, theme::kSmall),
                         theme::kSmall, theme::kMeta, 560.0f);
             list.push_opacity(live ? 1.0f : 0.4f);
             toggle(c, 1292.0f, top + kDialogRowHeight * 0.5f, mod.enabled ? 1.0f : 0.0f);

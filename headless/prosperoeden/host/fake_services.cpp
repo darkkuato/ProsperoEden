@@ -204,7 +204,17 @@ ui::Home FakeServices::home()
                     return game;
             return games_.front();
         };
-        const ui::Game &last = find("Echoes of the Valley");
+        // As the console does: a game taken away is not offered, the next recent one is.
+        const char *const recent[] = {"Echoes of the Valley", "Kart Carnival Deluxe", "Starfall Odyssey",
+                                      "Caf\xC3\xA9 Nocturne"};
+        const char *first = recent[0];
+        for (const char *name : recent)
+            if (game_exists(find(name).file))
+            {
+                first = name;
+                break;
+            }
+        const ui::Game &last = find(first);
         home.last_file = last.file;
         home.last_exists = true;
         home.last_title = last.name;
@@ -214,11 +224,11 @@ ui::Home FakeServices::home()
         home.last_title_id = last.title_id;
         home.last_addons = last.addons;
         home.last_language = last.language;
-        for (const char *name : {"Echoes of the Valley", "Kart Carnival Deluxe", "Starfall Odyssey",
-                                 "Caf\xC3\xA9 Nocturne"})
+        for (const char *name : recent)
         {
             const ui::Game &game = find(name);
-            home.recents.push_back({game.file, game.name, game.cover});
+            if (game_exists(game.file))
+                home.recents.push_back({game.file, game.name, game.cover});
         }
     }
     home.system_status = fill(tr("{0} games installed"), {std::to_string(games_.size())}) + "  /  " +
@@ -297,13 +307,33 @@ std::vector<ui::Mod> FakeServices::mods(std::uint64_t title_id)
     if (!has_mods || std::find(modded_.begin(), modded_.end(), title_id) == modded_.end())
         return {};
     std::vector<ui::Mod> mods = {
-        {"60 FPS", tr("Patch"), true},
-        {"Sharper textures", tr("Files"), true},
-        {"Starter pack", std::string(tr("Files")) + ", " + tr("Cheats"), true},
+        {"60 FPS", tr("Patch"), true, {}},
+        {"Sharper textures", tr("Files"), true, {}},
+        {"Starter pack", std::string(tr("Files")) + ", " + tr("Cheats"), true, {}},
     };
     for (ui::Mod &mod : mods)
         mod.enabled = std::find(mods_off_.begin(), mods_off_.end(), mod.name) == mods_off_.end();
+    for (const char *cheat : {"60 FPS", "30 FPS", "Infinite health", "All items", "Moon jump"})
+        mods.back().cheats.push_back(
+            {cheat, std::find(cheats_on_.begin(), cheats_on_.end(), cheat) != cheats_on_.end()});
     return mods;
+}
+
+bool FakeServices::set_cheat_enabled(std::uint64_t, const std::string &, const std::string &cheat,
+                                     bool enabled)
+{
+    const auto drop = [this](const std::string &name)
+    { cheats_on_.erase(std::remove(cheats_on_.begin(), cheats_on_.end(), name), cheats_on_.end()); };
+    drop(cheat);
+    if (!enabled)
+        return true;
+    if (cheat == "60 FPS" || cheat == "30 FPS")
+    {
+        drop("60 FPS");
+        drop("30 FPS");
+    }
+    cheats_on_.push_back(cheat);
+    return true;
 }
 
 bool FakeServices::set_mod_enabled(std::uint64_t, const std::string &name, bool enabled)
