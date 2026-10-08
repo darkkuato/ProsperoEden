@@ -10,7 +10,7 @@
 
 **ProsperoEden is an unofficial PlayStation 5 port of [Eden](https://github.com/eden-emulator/mirror)** - an accurate, high-performance emulator. All credit for the emulator core belongs to the Eden project and its contributors. ProsperoEden is not affiliated with or endorsed by the Eden team or Sony.
 
-This is an early alpha. Video, audio, controller input, and saves have been confirmed working. Compatibility and performance will vary between games. The current release is **v1.000.070**.
+This is an early alpha. Video, audio, controller input, and saves have been confirmed working. Compatibility and performance will vary between games. The current release is **v1.000.080**.
 
 ## Source code
 
@@ -58,7 +58,7 @@ The complete ProsperoEden source is in this repository: the PS5 frontend and lau
 - **Settings in one place** - a single JSON file under `/data/prosperoeden`, with game volume, mute, and detailed logging options. Logs keep the previous session.
 - **Updates from the menu** - when a newer release is listed on [homebrew.page](https://homebrew.page/ps5), ProsperoEden offers to install it each time it opens; **Skip** keeps the current version; see [Updating](#updating).
 - **Crash reports** - if ProsperoEden stops because of an error, it saves a report with that session's logs, starts again and shows where the report is.
-- **Controllers, audio, and saves** - up to four DualSense controllers (one per signed-in PS5 user) with rumble and motion controls, game audio, and save data work out of the box.
+- **Controllers, audio, and saves** - up to four DualSense controllers (one per signed-in PS5 user) with rumble and motion controls, game audio, and save data work out of the box. Games that have a single Joy-Con held sideways are played with the DualSense held as usual: the stick, the buttons and the motion sensors are turned to match.
 
 ## Install
 
@@ -230,6 +230,14 @@ The launcher follows the language the PS5 is set to: Arabic, Chinese (simplified
 
 Earlier versions read everything from `/data/homebrew/PPSA99008/assets/`. That folder keeps working until you choose a game files folder, and settings are migrated automatically on first launch. To move to the new layout, move `assets/keys`, `assets/firmware` and `assets/roms` into any folder, then select it in **Settings > Game files**. The release ZIP contains no user files, so copy its app files over your installation without deleting your own data.
 
+## Changes in v1.000.080
+
+- **Single Joy-Con games with the DualSense held as usual.** A game that has a single Joy-Con held sideways no longer needs the DualSense turned sideways: the stick, the four buttons and the motion sensors are turned to match, for each player. L1 and R1 stay SL and SR.
+- **What's new in the update dialog.** When an update is offered, **What's new** shows that release's notes before you decide.
+- **Start a game directly.** ProsperoEden takes `--rom <file>` and `--exit-after-game` as launch arguments, so a home screen forwarder can open one game; see [docs/FORWARDER.md](docs/FORWARDER.md).
+- **Filesystem access on firmware 13.60.** The bundled helper is updated with a fix for that firmware.
+- **Release ZIP opens with the right permissions.** Its files are stored open to all, as the console wants an app's files; unpacked with their permissions kept, they could give "Can't start the game or app" (CE-107750-0).
+
 ## Changes in v1.000.070
 
 - **ProsperoEden starts wherever it is installed.** On a USB drive, extended storage, an etaHEN games folder or any other place ShadowMountPlus mounts it from, it could not find its own files and closed after a moment. It now reads its files from where the PS5 mounts the running app.
@@ -330,7 +338,6 @@ The touchpad is pressed as a button. On its own, a tap of the touchpad presses t
 - **More performance** - CPU and GPU work to keep demanding games at their target frame rate: the short stutter when a game reaches new areas (the block list, **Compile ahead** in **Settings > Performance**, once it has run in more games and can be on by default), heavy cutscenes, and games that run slower in Docked mode than in Handheld.
 - **More reliable game loading** - a game that hangs while it loads can now be left with Touchpad + L1; the hangs themselves still need a log from a game that does it.
 - **Controller type per game** - some games only work with a Handheld controller or Joy-Cons, not the Pro Controller every player gets today. Add a **Controller type** choice to each game's Controls: Pro Controller (the default), Handheld, Dual Joy-Cons, Left Joy-Con or Right Joy-Con.
-- **Sideways play for single Joy-Con games** - games that use one Joy-Con held sideways have the DualSense held sideways too. Turn its motion sensors to match that grip (today tilting moves the wrong way), and keep the in-game shortcuts from being pressed by accident in it: holding the controller that way, Touchpad + L1 is easy to hit and ends the game.
 - **Real Joy-Cons and Pro Controllers (investigation)** - play with the original controllers connected to the PS5. The PS5 does not pair them itself, so this first needs to find out whether a homebrew app can read them: a wired Pro Controller over USB looks more likely than Joy-Cons, which only connect over Bluetooth.
 - **Typing text in games** - when a game asks for text (a character's name, an answer during an event), show a keyboard instead of answering with the game's default text as now: the PS5's own on-screen keyboard if a homebrew app can open it (it also takes a USB or Bluetooth keyboard the PS5 supports), otherwise one of our own. A USB keyboard's keys could also be mapped to the game's buttons, like the DualSense's.
 - **Multiplayer with Eden on other systems (investigation)** - join Eden's multiplayer rooms from the PS5 and play with Eden players on PC, Linux and Android, entering a room's address by hand, including a room hosted on your local network (no PSN needed). Rooms only accept the same Eden version on every side, so each release would name the matching PC version.
