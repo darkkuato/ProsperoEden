@@ -25,7 +25,10 @@ builds on the following projects, each under its own license.
   and `tools/validate-loader-elf.py`.
 - **[miniz](https://github.com/richgel999/miniz)** 3.0.2, MIT, unmodified in
   `third_party/miniz` with its `LICENSE`. The self-update helper reads release
-  ZIPs with it.
+  ZIPs with it; the app packs and unpacks save data for the save sync with it.
+- **[QR Code generator library](https://github.com/nayuki/QR-Code-generator)** (C), MIT,
+  unmodified in `third_party/qrcodegen` with its `LICENSE`. The launcher draws the QR code
+  of a save sync's pairing with it.
 - **LLVM compiler-rt** `emutls.c`, Apache-2.0 WITH LLVM-exception.
 
 ## Graphics
@@ -72,11 +75,8 @@ builds on the following projects, each under its own license.
   not have. `stb_image_write` saves the PC previews and is not part of the app.
 - The launcher's sound effects were generated with
   [ElevenLabs](https://elevenlabs.io) and edited for this project.
-- `third_party/ps5_pad.hpp` comes from
-  [ps5-native-gamepad-input-research](https://github.com/blackbearreloaded/ps5-native-gamepad-input-research),
-  and `third_party/native_audio.hpp` from
-  [ps5-audio-decoding-research](https://github.com/blackbearreloaded/ps5-audio-decoding-research).
-  Both are GPL-3.0-or-later.
+- `third_party/ps5_pad.hpp` and `third_party/native_audio.hpp` are this
+  project's own platform declarations, GPL-3.0-or-later.
 
 ## Thanks
 

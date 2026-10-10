@@ -995,6 +995,28 @@ if(PS5_NATIVE)
     string(REPLACE "                ASSERT(r == int(nso_header.segments[i].size));" "                if (r != int(nso_header.segments[i].size)) return std::nullopt;" nso_source "${nso_source}")
     string(REPLACE "                std::memcpy(codeset.memory.data() + module_start + nso_header.segments[i].location, decompressed_size.data(), nso_header.segments[i].size);" "" nso_source "${nso_source}")
     string(REPLACE "            } else {\n                std::memcpy(codeset.memory.data() + module_start + nso_header.segments[i].location, compressed_data.data(), nso_header.segments[i].size);" "" nso_source "${nso_source}")
+    # Cheats address the game's main module. Eden registers a cheat list for every module that
+    # has one, and the last registration wins: a cheat file without a build ID in its name
+    # (mods/<title ID>/cheat_<name>.txt) matches every module, so its cheats were applied
+    # against the last module loaded (sdk) and changed nothing in the game.
+    set(old_nso_cheats [=[        if (!cheats.empty()) {
+            system.RegisterCheatList(cheats, nso_header.build_id, load_base, image_size);]=])
+    set(new_nso_cheats [=[        if (name == "main") {
+            // The build ID a cheat file for this version of the game is named after.
+            char build[17]{};
+            for (int i = 0; i < 8; ++i)
+                std::snprintf(build + i * 2, 3, "%02X", static_cast<unsigned>(nso_header.build_id[i]));
+            std::fprintf(stderr, "[ProsperoEden] cheats: %zu entries for main (build ID %s) at %#llx (%llu bytes)\n",
+                         cheats.size(), build, static_cast<unsigned long long>(load_base),
+                         static_cast<unsigned long long>(image_size));
+        }
+        if (name == "main" && !cheats.empty()) {
+            system.RegisterCheatList(cheats, nso_header.build_id, load_base, image_size);]=])
+    string(FIND "${nso_source}" "${old_nso_cheats}" nso_cheats_offset)
+    if(nso_cheats_offset LESS 0)
+        message(FATAL_ERROR "Pinned NSO cheat registration changed")
+    endif()
+    string(REPLACE "${old_nso_cheats}" "${new_nso_cheats}" nso_source "${nso_source}")
     string(PREPEND nso_source "#include <cstdio>\n")
     write_derived("${PORT_BUILD_DIR}/nso.cpp" "${nso_source}")
     list(REMOVE_ITEM core_sources loader/nso.cpp)
@@ -1595,7 +1617,7 @@ set(audio_contract "${PORT_ROOT}/third_party")
 file(SHA256 "${pad_contract}/ps5_pad.hpp" pad_hash)
 file(SHA256 "${audio_contract}/native_audio.hpp" audio_hash)
 if(NOT pad_hash STREQUAL "6a9708fe7ab59afa69899e1981e84decf1492a97e8ebd08194f8e27841a00ee0" OR
-   NOT audio_hash STREQUAL "5274633c4f7cd4598fc4cdbfe5b044cbfca908845eb22157e73a80dca8faa0f6")
+   NOT audio_hash STREQUAL "54627379f641d608a9a5c6a96ebdfc543a0dbb8a1e843e0ce08cb6e3adb93528")
     message(FATAL_ERROR "Native device contracts changed; review the adapter ABI first.")
 endif()
 # Guest rumble: with no mapped buttons (this frontend binds the virtual_gamepad engine), send each
@@ -1907,6 +1929,23 @@ if(EDEN_DEV_PROFILE)
     list(REMOVE_ITEM video_sources engines/maxwell_3d.cpp)
     list(APPEND video_sources "${PORT_BUILD_DIR}/maxwell_3d.cpp")
 endif()
+# The shader cache file's reader checks what it reads and keeps the whole entries of a damaged
+# file (shader_cache_reader.inc; shader_cache_check.cpp checks it on the host).
+file(READ "${PROJECT_SOURCE_DIR}/src/video_core/shader_environment.cpp" shader_environment_source)
+string(FIND "${shader_environment_source}" "void LoadPipelines(" shader_reader_begin)
+string(FIND "${shader_environment_source}" "} // namespace VideoCommon" shader_reader_end REVERSE)
+if(shader_reader_begin LESS 0 OR shader_reader_end LESS shader_reader_begin)
+    message(FATAL_ERROR "Pinned shader cache reader changed")
+endif()
+string(SUBSTRING "${shader_environment_source}" 0 ${shader_reader_begin} shader_environment_head)
+string(SUBSTRING "${shader_environment_source}" ${shader_reader_end} -1 shader_environment_tail)
+string(PREPEND shader_environment_head "#include <cstdio>\n#include <new>\n#include <stdexcept>\n#include <system_error>\n")
+write_derived("${PORT_BUILD_DIR}/shader_environment.cpp"
+    "${shader_environment_head}#include \"${EDEN_PORT_DIR}/shader_cache_reader.inc\"\n\n${shader_environment_tail}")
+set_property(SOURCE "${PORT_BUILD_DIR}/shader_environment.cpp" APPEND PROPERTY OBJECT_DEPENDS
+    "${EDEN_PORT_DIR}/shader_cache_reader.inc")
+list(REMOVE_ITEM video_sources shader_environment.cpp)
+list(APPEND video_sources "${PORT_BUILD_DIR}/shader_environment.cpp")
 set_property(TARGET video_core PROPERTY SOURCES "${video_sources}")
 
 if(PS5_NATIVE)
@@ -2142,6 +2181,10 @@ else()
     target_link_libraries(eden-memory-check PRIVATE dynarmic common)
     target_compile_options(eden-scalar-check PRIVATE -fno-rtti)
     add_executable(eden-ryujinx-check "${EDEN_PORT_DIR}/ryujinx_check.cpp")
+    add_executable(eden-shader-cache-check "${EDEN_PORT_DIR}/shader_cache_check.cpp")
+    target_include_directories(eden-shader-cache-check PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(eden-shader-cache-check PRIVATE video_core)
+    target_compile_options(eden-shader-cache-check PRIVATE -fno-rtti)
     add_executable(eden-mods-check "${EDEN_PORT_DIR}/mods_check.cpp")
     target_include_directories(eden-mods-check PRIVATE "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(eden-mods-check PRIVATE core)
@@ -2160,6 +2203,10 @@ else()
     add_executable(eden-profiles-check "${EDEN_PORT_DIR}/profiles_check.cpp")
     target_link_libraries(eden-profiles-check PRIVATE core)
     target_compile_options(eden-profiles-check PRIVATE -UNDEBUG)
+    # save-sync.json kept in step with the profiles (save_sync_config.h).
+    add_executable(eden-save-sync-check "${EDEN_PORT_DIR}/save_sync_check.cpp")
+    target_link_libraries(eden-save-sync-check PRIVATE core)
+    target_compile_options(eden-save-sync-check PRIVATE -UNDEBUG)
     # The update check's decision, without its network side (update_notice.h).
     add_executable(eden-update-check
         "${EDEN_PORT_DIR}/update_check_check.cpp" "${EDEN_PORT_DIR}/update_check/update_check.c")
@@ -2179,6 +2226,13 @@ write_derived("${PORT_BUILD_DIR}/version/app_version.h"
     "// Generated from sce_sys/param.json (contentVersion).\n#pragma once\n#define EDEN_APP_VERSION \"${app_version}\"\n")
 target_include_directories(eden-headless PRIVATE "${PORT_BUILD_DIR}/version")
 target_link_libraries(eden-headless PRIVATE core eden-pad)
+# A game's text entry on the PS5's own on-screen keyboard (system_keyboard.h, keyboard_applet.h).
+target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/system_keyboard.cpp")
+if(PS5_NATIVE)
+    target_link_libraries(eden-headless PRIVATE
+        "${sdk}/target/lib/libSceImeDialog.so" "${sdk}/target/lib/libSceSysmodule.so"
+        "${PORT_ROOT}/build/stubs/libSceCommonDialog.so")
+endif()
 add_library(eden-metadata STATIC "${EDEN_PORT_DIR}/metadata_bridge.cpp")
 target_include_directories(eden-metadata PUBLIC "${EDEN_PORT_DIR}" PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(eden-metadata PUBLIC core stb)
@@ -2263,12 +2317,12 @@ if(EDEN_PS5_OPENGL)
     target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/graphics.cpp")
     # The loading screen's shader as a string for the OpenGL window; the Vulkan HUD pass includes
     # the same two files (vulkan_hud.frag).
-    file(READ "${EDEN_PORT_DIR}/loading_wordmark.glsl" loading_wordmark)
+    file(READ "${EDEN_PORT_DIR}/loading_text.glsl" loading_wordmark)
     file(READ "${EDEN_PORT_DIR}/loading_scene.glsl" loading_scene)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-        "${EDEN_PORT_DIR}/loading_wordmark.glsl" "${EDEN_PORT_DIR}/loading_scene.glsl")
+        "${EDEN_PORT_DIR}/loading_text.glsl" "${EDEN_PORT_DIR}/loading_scene.glsl")
     write_derived("${PORT_BUILD_DIR}/include/loading_scene_glsl.h"
-        "// Generated from loading_wordmark.glsl and loading_scene.glsl.\n#pragma once\ninline constexpr const char* kLoadingSceneGlsl = R\"glsl(\n${loading_wordmark}${loading_scene})glsl\";\n")
+        "// Generated from loading_text.glsl and loading_scene.glsl.\n#pragma once\ninline constexpr const char* kLoadingSceneGlsl = R\"glsl(\n${loading_wordmark}${loading_scene})glsl\";\n")
     target_compile_definitions(eden-headless PRIVATE EDEN_PS5_OPENGL=1)
     target_link_libraries(eden-headless PRIVATE PS5OpenGL::OpenGL glad)
 endif()
@@ -2301,6 +2355,10 @@ endif()
                 "${launcher_dir}/pe/ui/browse.cpp"
                 "${launcher_dir}/pe/ui/game_options.cpp"
                 "${launcher_dir}/pe/ui/profiles.cpp"
+                "${launcher_dir}/pe/ui/remote.cpp"
+                "${launcher_dir}/pe/ui/save_sync.cpp"
+                "${launcher_dir}/pe/ui/pairing.cpp"
+                "${launcher_dir}/pe/ui/qr_code.cpp"
                 "${launcher_dir}/pe/ui/update.cpp"
                 "${launcher_dir}/pe/ui/home.cpp"
                 "${launcher_dir}/pe/ui/launcher.cpp"
@@ -2309,6 +2367,34 @@ endif()
                 "${launcher_dir}/pe/ui/textures.cpp"
                 "${launcher_dir}/pe/ui/widgets.cpp")
             target_sources(eden-headless PRIVATE ${launcher_sources})
+            # Download sources and their queue (remote/remote.h), with their backends (remote/source.h,
+            # backends.h) and the console's FTP server that writes the files (remote/ftp.h); their
+            # HTTP (remote/http.c) is linked into the update check's object below, with its libcurl.
+            target_sources(eden-headless PRIVATE
+                "${EDEN_PORT_DIR}/remote/remote.cpp"
+                "${EDEN_PORT_DIR}/remote/backends.cpp"
+                "${EDEN_PORT_DIR}/remote/ftp.cpp"
+                "${EDEN_PORT_DIR}/remote/stream_check.cpp"
+                "${EDEN_PORT_DIR}/remote/save_archive.cpp"
+                "${EDEN_PORT_DIR}/remote/save_sync.cpp"
+                "${EDEN_PORT_DIR}/remote/romm/romm_client.cpp"
+                "${EDEN_PORT_DIR}/remote/romm/romm_saves.cpp"
+                "${EDEN_PORT_DIR}/remote/romm/romm_source.cpp")
+            # The save data's zips (remote/save_archive.h): miniz, as the self-update helper has it.
+            add_library(prosperoeden-miniz STATIC
+                "${PORT_ROOT}/third_party/miniz/miniz.c"
+                "${PORT_ROOT}/third_party/miniz/miniz_tdef.c"
+                "${PORT_ROOT}/third_party/miniz/miniz_tinfl.c"
+                "${PORT_ROOT}/third_party/miniz/miniz_zip.c")
+            target_include_directories(prosperoeden-miniz PUBLIC "${PORT_ROOT}/third_party/miniz")
+            target_compile_options(prosperoeden-miniz PRIVATE -w)
+            target_link_libraries(eden-headless PRIVATE prosperoeden-miniz)
+            # Their MD5 is OpenSSL's (linked below for the update check), as is the SHA-256 a
+            # download's contents are checked with (remote/stream_check.h). Its include folder, for
+            # these files only: the prefix it is in has older FFmpeg headers as well.
+            set_source_files_properties("${EDEN_PORT_DIR}/remote/save_archive.cpp"
+                "${EDEN_PORT_DIR}/remote/stream_check.cpp"
+                PROPERTIES INCLUDE_DIRECTORIES "${OPENSSL_INCLUDE_DIR}")
             # The update check (update_notice.h). Its network side is the boilerplate's
             # update_check.c and console_curl.c with libcurl and libpsl from the pinned PacBrew
             # prefix that already supplies OpenSSL and zlib (zstd is Eden's own). They are linked
@@ -2329,8 +2415,9 @@ endif()
                 "${EDEN_PORT_DIR}/update_check/console_curl.c"
                 "${EDEN_PORT_DIR}/update_check/self_update.c"
                 "${EDEN_PORT_DIR}/update_check/self_update_ps5.c"
-                "${EDEN_PORT_DIR}/update_check/self_update_sha256.c")
-            target_include_directories(update-check PRIVATE "${OPENSSL_INCLUDE_DIR}")
+                "${EDEN_PORT_DIR}/update_check/self_update_sha256.c"
+                "${EDEN_PORT_DIR}/remote/http.c")
+            target_include_directories(update-check PRIVATE "${OPENSSL_INCLUDE_DIR}" "${EDEN_PORT_DIR}/update_check")
             # The kit's paths are the app's own: after elevation /app0 and /download0 are gone
             # (update_notice.cpp gives them).
             target_compile_definitions(update-check PRIVATE CURL_STATICLIB=1

@@ -33,11 +33,13 @@
 #include <nlohmann/json.hpp>
 #include "devices.h"
 #include "diagnostics.h"
+#include "hud.h"
 #include "display_refresh.h"
-#include "log_pipe.h"
+#include "log_flusher.h"
 #include "mods.h"
 #include "controller_applet.h"
 #include "error_applet.h"
+#include "keyboard_applet.h"
 #include "preferences.h"
 #include "metadata_bridge.h"
 #ifdef EDEN_PS5_OPENGL
@@ -191,6 +193,9 @@ int main(int argc, char** argv) {
         std::setvbuf(report, nullptr, _IONBF, 0);
 #ifdef PS5_NATIVE
         Eden::BootTrace::Begin(Eden::kAppVersion, __DATE__ " " __TIME__);
+        // The PS5 keyboard's module, for a game's text entry: asked for before anything else
+        // changes what the app may load (system_keyboard.h).
+        Eden::BootTrace::Line("PS5 keyboard module: %#x", static_cast<unsigned>(Eden::PrepareSystemKeyboard()));
         Eden::BootTrace::Line("requesting filesystem access");
         // Filesystem access beyond the sandbox, first: every path below depends on it
         // (assets_dir.h). A resident upstream Lapy service gets the first opportunity; otherwise
@@ -235,14 +240,10 @@ int main(int argc, char** argv) {
 #endif
         if (!std::freopen(Eden::LogFile("stderr.log").c_str(), "w", stderr) ||
             !std::freopen(Eden::LogFile("heap.log").c_str(), "w", stdout)) return 2;
-        std::setvbuf(stderr, nullptr, _IONBF, 0);
-        // Batch SDK success traces; phase receipts still flush explicitly.
-        static char stdout_buffer[64 * 1024];
-        if (std::setvbuf(stdout, stdout_buffer, _IOFBF, sizeof(stdout_buffer)) != 0) return 2;
-        // Console storage writes take ~25 ms each; background threads copy both streams to disk.
-        static Eden::LogPipe stderr_pipe, stdout_pipe;
-        if (!stderr_pipe.Attach(stderr) || !stdout_pipe.Attach(stdout))
-            Eden::Report("logs", "Asynchronous log writing unavailable; writing directly");
+        // Console storage writes take ~25 ms each; a background thread writes both streams out,
+        // unless Settings > Diagnostics asks for every line at once (to find a crash).
+        static Eden::LogFlusher log_flusher;
+        if (!log_flusher.Start(Eden::LoadPreferences().immediate_logs)) return 2;
         Eden::Crash::Install(Eden::LogsDir(), Eden::kAppVersion, last_crash.restarted);
         Eden::BootTrace::Ready(Eden::LogsDir(), Eden::FilesystemAccess());
         Eden::BootTrace::Line("logs and crash handler ready (%s)", Eden::LogsDir().c_str());
@@ -1010,14 +1011,30 @@ int main(int argc, char** argv) {
             // One Pro Controller per signed-in user's DualSense; later changes apply mid-game.
             const unsigned connected = pad->ConnectedPlayers();
             (void)pad->TakeConnectionChanges();
+            // The game's own Controller type (Game settings > Controls), a Pro Controller without
+            // one. The handheld is a controller of its own, for player 1 only.
+            Eden::session_controller = controls.controller;
+            const bool handheld = Eden::ControllerSetting(controls.controller) == Settings::ControllerType::Handheld;
+            Eden::handheld_in_use = handheld;
             for (std::size_t index = 0; index < Eden::Pad::kMaxPlayers; ++index) {
                 auto& player = Settings::values.players.GetValue()[index];
-                player.connected = index == 0 || (connected & (1u << index)) != 0;
-                player.controller_type = Settings::ControllerType::ProController;
+                player.connected = handheld ? false : index == 0 || (connected & (1u << index)) != 0;
+                player.controller_type = handheld ? Settings::ControllerType::ProController :
+                                                    Eden::ControllerSetting(controls.controller);
                 // DualSense rumble (headless/pad.cpp) at Eden's full strength.
                 player.vibration_enabled = true;
                 player.vibration_strength = 100;
             }
+            {
+                auto& player = Settings::values.players.GetValue()[8];  // Eden's handheld controller
+                player.connected = handheld;
+                player.controller_type = Settings::ControllerType::Handheld;
+                player.vibration_enabled = true;
+                player.vibration_strength = 100;
+            }
+            if (controls.controller >= 0)
+                Eden::Report("launch", (std::string("Controller type: ") +
+                                        Eden::kControllerKeys[controls.controller]).c_str());
         }
         {
 #ifdef EDEN_PS5_OPENGL
@@ -1100,6 +1117,8 @@ int main(int argc, char** argv) {
                     if (pad) applets.controller = std::make_unique<Eden::PadControllerApplet>(system.HIDCore(), *pad);
                     // A game's error dialog: logged and closed, so the game carries on.
                     applets.error = std::make_unique<Eden::LoggedErrorApplet>();
+                    // A game's text entry: the PS5's own on-screen keyboard.
+                    applets.software_keyboard = std::make_unique<Eden::SystemKeyboardApplet>(Eden::AskSystemKeyboard);
                     system.GetFrontendAppletHolder().SetFrontendAppletSet(std::move(applets));
                 }
                 Service::AM::FrontendAppletParameters params{
@@ -1134,6 +1153,7 @@ int main(int argc, char** argv) {
                     }
                 });
 #endif
+                Eden::Loading::Set(Eden::Loading::Step::game);
                 Eden::BootTrace::Line("loading the game");
                 Core::SystemResultStatus loaded;
                 try {
@@ -1171,6 +1191,7 @@ int main(int argc, char** argv) {
 #endif
                 Eden::BootTrace::Line("game loaded (status %u)", static_cast<unsigned>(loaded));
                 Eden::Report("loader", "Game loaded; initializing renderer");
+                Eden::Loading::Set(Eden::Loading::Step::graphics);
 #ifdef EDEN_PS5_OPENGL
                 // Retain the failure, then release CPU readiness and complete normal
                 // shutdown before reporting it. Unwinding before OnGpuReady can hang.
@@ -1206,6 +1227,7 @@ int main(int argc, char** argv) {
                     // every five seconds so a slow build can be told apart from a stalled one.
                     std::atomic<size_t> built{0}, total{0};
                     std::atomic<bool> counted{false};
+                    Eden::Loading::Set(Eden::Loading::Step::shaders);
                     const auto load_start = std::chrono::steady_clock::now();
                     std::jthread reporter([&](std::stop_token stop) {
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
@@ -1229,6 +1251,7 @@ int main(int argc, char** argv) {
                         [&](VideoCore::LoadCallbackStage stage, size_t value, size_t count) {
                             if (stage != VideoCore::LoadCallbackStage::Build) return;
                             built = value;
+                            Eden::Loading::Shaders(value, count);
                             total = count;
                             counted = true;
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
@@ -1306,6 +1329,7 @@ int main(int argc, char** argv) {
                     jit_list.Start(system.GetApplicationProcessProgramID(), build, code_start, code_end - code_start);
                 }
                 Eden::TakeGuestFault(); // Nothing from an earlier session belongs to this one.
+                Eden::Loading::Set(Eden::Loading::Step::starting);
                 system.Run();
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
                 Eden::Stall::Trace("main running");
@@ -1410,8 +1434,11 @@ int main(int argc, char** argv) {
                                 const bool present = (connected & (1u << index)) != 0;
                                 Settings::values.players.GetValue()[index].connected = present;
                                 auto* controller = system.HIDCore().GetEmulatedControllerByIndex(index);
+                                // With the handheld chosen, the game has one player.
+                                const auto chosen = Eden::ChosenStyle(Eden::session_controller.load());
+                                if (present && chosen == Core::HID::NpadStyleIndex::Handheld) continue;
                                 if (present) {
-                                    controller->SetNpadStyleIndex(Core::HID::NpadStyleIndex::Fullkey);
+                                    controller->SetNpadStyleIndex(chosen.value_or(Core::HID::NpadStyleIndex::Fullkey));
                                     controller->Connect();
                                 } else {
                                     controller->Disconnect();

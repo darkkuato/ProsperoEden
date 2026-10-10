@@ -20,7 +20,7 @@ constexpr Rect kListPanel{108.0f, 188.0f, 820.0f, 720.0f};
 constexpr Rect kDetailPanel{980.0f, 188.0f, 820.0f, 720.0f};
 constexpr Rect kDialog{550.0f, 180.0f, 820.0f, 720.0f};
 constexpr float kRowsTop = 264.0f;
-constexpr float kRowHeight = 64.0f;
+constexpr float kRowHeight = 54.0f;
 enum Category
 {
     kProfiles,
@@ -31,16 +31,18 @@ enum Category
     kAccessibility,
     kDiagnostics,
     kFiles,
+    kDownloads,
+    kSaveSync,
     kLanguage,
     kCategoryCount,
 };
 constexpr const char *kCategories[kCategoryCount] = {
     TR("Profiles"), TR("Video"), TR("Performance"), TR("Audio"), TR("Controls"), TR("Accessibility"),
-    TR("Diagnostics"), TR("Game files"), TR("Language")};
+    TR("Diagnostics"), TR("Game files"), TR("Downloads"), TR("Save sync"), TR("Language")};
 // The same as headings: capitals differ by language, so each is its own text.
 constexpr const char *kHeadings[kCategoryCount] = {
     TR("PROFILES"), TR("VIDEO"), TR("PERFORMANCE"), TR("AUDIO"), TR("CONTROLS"), TR("ACCESSIBILITY"),
-    TR("DIAGNOSTICS"), TR("GAME FILES"), TR("LANGUAGE")};
+    TR("DIAGNOSTICS"), TR("GAME FILES"), TR("DOWNLOADS"), TR("SAVE SYNC"), TR("LANGUAGE")};
 
 // The Video dialog's rows, and the window that shows five of them (placed as a game's settings
 // are).
@@ -139,6 +141,12 @@ void Launcher::press_settings(Key key)
         case kProfiles:
             open_profiles();
             break;
+        case kDownloads:
+            open_sources();
+            break;
+        case kSaveSync:
+            open_sync_setup();
+            break;
         case kVideo:
             open_modal(Modal::video);
             video_rows_.visible = kVideoRowsShown;
@@ -192,8 +200,18 @@ void Launcher::draw_settings(Canvas &c)
         prefs_.mute ? tr("Muted") : percent(prefs_.volume),
         prefs_.vibration ? tr("Vibration on") : tr("Vibration off"),
         prefs_.large_text || prefs_.high_contrast || prefs_.reduce_motion ? tr("On") : "",
-        prefs_.detailed_logging ? tr("Detailed logs on") : "",
+        prefs_.detailed_logging ? tr("Detailed logs on") : prefs_.immediate_logs ? tr("On") : "",
         "",
+        !sources_.configured ? std::string{tr("Not set up")} :
+        sources_.list.size() == 1 ? sources_.list.front().name :
+                                    fill(tr("{0} sources"), {std::to_string(sources_.list.size())}),
+        [&] {
+            int linked = 0;
+            for (const SaveSyncProfile &profile : sync_setup_.profiles)
+                linked += profile.linked ? 1 : 0;
+            return linked == 0 ? std::string{tr("Off")} : fill(tr("{0} of {1} profiles"), {std::to_string(linked),
+                                                                                           std::to_string(sync_setup_.profiles.size())});
+        }(),
         pick(services_.language_labels(), prefs_.language),
     };
     for (int row = 0; row < kCategoryCount; ++row)
@@ -288,6 +306,42 @@ void Launcher::draw_settings(Canvas &c)
         if (!saved_folder.empty() && saved_folder != folder)
             lines.push_back({tr("NEXT START"), short_path(saved_folder, 34)});
         break;
+    case kDownloads:
+    {
+        about = tr("Games on your network, downloaded when you play them.");
+        int queued = 0;
+        for (const Download &download : downloads_)
+            queued += download.state != DownloadState::failed ? 1 : 0;
+        if (!sources_.configured)
+            lines.push_back({tr("SOURCES"), tr("Not set up")});
+        // Each source with its state; three at most, the FTP server that writes the downloads and the
+        // queue under them.
+        for (std::size_t i = 0; i < sources_.list.size() && i < 3; ++i)
+        {
+            const SourceInfo &source = sources_.list[i];
+            lines.push_back({source.name.c_str(), source.refreshing ? std::string{tr("Reading...")} :
+                                                  source.online     ? fill(tr("{0} games"), {std::to_string(source.games)}) :
+                                                                      std::string{tr("Offline")}});
+        }
+        lines.push_back({tr("FTP SERVER"), fill(tr("Port {0}"), {std::to_string(sources_.ftp_port)})});
+        lines.push_back({tr("DOWNLOADS"), std::to_string(queued)});
+        break;
+    }
+    case kSaveSync:
+    {
+        about = tr("Each profile's save data on a server of its own, synced before and after a game.");
+        if (!sync_setup_.error.empty())
+            lines.push_back({tr("SAVE-SYNC.JSON"), tr("Not readable")});
+        for (std::size_t i = 0; i < sync_setup_.profiles.size() && i < 4; ++i)
+        {
+            const SaveSyncProfile &profile = sync_setup_.profiles[i];
+            lines.push_back({profile.name.c_str(), profile.linked ? (profile.note.empty() ? tr("Linked") : tr("Needs attention")) :
+                                                                    tr("Not linked")});
+        }
+        if (!sync_setup_.automatic)
+            lines.push_back({tr("SYNC"), tr("Off")});
+        break;
+    }
     default:
         about = tr("The language games use when they offer it.");
         lines = {{tr("LANGUAGE"), pick(services_.language_labels(), prefs_.language)},
@@ -337,9 +391,13 @@ int Launcher::dialog_rows(Modal modal) const
     case Modal::game:
         // Console mode, video, performance, audio, controls, language, mods; save data in builds
         // that move saves.
-        return services_.save_transfer_available() ? 8 : 7;
-    case Modal::controls:
-        // Vibration, the button mapping.
+        // A game a download source has can be deleted from the console (and downloaded again).
+        return (services_.save_transfer_available() ? 8 : 7) +
+               (library_.selected < static_cast<int>(games_.size()) &&
+                        !games_[static_cast<std::size_t>(library_.selected)].sources.empty() &&
+                        !games_[static_cast<std::size_t>(library_.selected)].remote ? 1 : 0);
+    case Modal::controls:     // vibration, the button mapping
+    case Modal::diagnostics:  // detailed logging, logs written at once
         return 2;
     default:
         return 1;
@@ -361,6 +419,8 @@ float Launcher::dialog_row_top(Modal modal, int row) const
         return 334.0f + 96.0f * static_cast<float>(row);
     case Modal::controls: // under the shortcuts
         return 560.0f + 96.0f * static_cast<float>(row);
+    case Modal::diagnostics: // under the setup's state
+        return 500.0f + 102.0f * static_cast<float>(row);
     default:
         return 670.0f;
     }
@@ -472,7 +532,10 @@ void Launcher::press_dialog(Key key)
             prefs_.reduce_motion = !prefs_.reduce_motion;
         break;
     case Modal::diagnostics:
-        prefs_.detailed_logging = !prefs_.detailed_logging;
+        if (option_ == 0)
+            prefs_.detailed_logging = !prefs_.detailed_logging;
+        else
+            prefs_.immediate_logs = !prefs_.immediate_logs;
         break;
     default:
         return;
@@ -699,11 +762,25 @@ void Launcher::draw_dialog(Canvas &c, Modal modal, float open)
         break;
     }
     default:
+    {
         text_block(c, services_.setup_details(), 592.0f, baseline(364.0f, 40.0f, theme::kText24),
-                   theme::kText24, 40.0f, theme::kBody, 736.0f, 7);
-        label(0, tr("Detailed logging"), kToggle);
-        toggle(c, 1292.0f, row_centre(0), knob);
+                   theme::kText24, 40.0f, theme::kBody, 736.0f, 3, kShrink);
+        static constexpr const char *kNames[] = {TR("Detailed logging"), TR("Write logs at once")};
+        static constexpr const char *kAbout[] = {
+            TR("Eden's debug messages in the logs of a game."),
+            TR("Keeps the last line before a crash, but games stutter. From the next start.")};
+        for (int row = 0; row < 2; ++row)
+        {
+            label(row, tr(kNames[row]), kToggle);
+            toggle(c, 1292.0f, row_centre(row),
+                   tween::clamp01(switches_[static_cast<std::size_t>(row)].value));
+        }
+        // What the highlighted switch does.
+        text_block(c, tr(kAbout[std::clamp(option_, 0, 1)]), 592.0f,
+                   baseline(716.0f, 30.0f, theme::kSmall), theme::kSmall, 30.0f, theme::kMeta, 736.0f,
+                   2, kShrink);
         break;
+    }
     }
 
     if (scrolls)

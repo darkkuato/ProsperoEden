@@ -277,7 +277,6 @@ public:
             std::printf("EDEN_DEV_FRAME frames=%u seconds=%.6f fps=%.3f worst_ms=%.3f total=%u\n",
                         sample_frames, now - sample_start, sample_frames / (now - sample_start),
                         worst_frame * 1000.0, presented_frames);
-            std::fflush(stdout);
             sample_start = now;
             sample_frames = 0;
             worst_frame = 0;
@@ -295,7 +294,6 @@ public:
                             sample_frames, now - sample_start,
                             sample_frames / (now - sample_start), sample_worst * 1000.0,
                             presented_frames);
-                std::fflush(stdout);
                 sample_start = now;
                 sample_frames = 0;
                 sample_worst = 0;
@@ -342,8 +340,8 @@ private:
         SCOPE_EXIT { Cleanup(eglMakeCurrent(display, surface, surface, context), "loading restore"); };
         if (!loading_program) {
             const std::string fragment = std::string("#version 330 core\n") + kLoadingSceneGlsl +
-                "uniform vec2 size; uniform float seconds; out vec4 color;\n"
-                "void main(){ color = vec4(loading_scene(gl_FragCoord.xy, size, seconds), 1.0); }\n";
+                "uniform vec2 size; uniform float seconds; uniform uint state[24]; out vec4 color;\n"
+                "void main(){ color = vec4(loading_scene(gl_FragCoord.xy, size, seconds, state), 1.0); }\n";
             const char* sources[]{
                 "#version 330 core\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
                 "gl_Position=vec4(p*2.0-1.0,0.0,1.0);}",
@@ -389,6 +387,9 @@ private:
         glViewport(0, 0, width, height);
         glUniform2f(glGetUniformLocation(loading_program, "size"), float(width), float(height));
         glUniform1f(glGetUniformLocation(loading_program, "seconds"), float(seconds));
+        // What the start is doing (hud.h).
+        const auto state = Loading::State();
+        glUniform1uiv(glGetUniformLocation(loading_program, "state[0]"), state.size(), state.data());
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glFlush();
         return true;
@@ -660,7 +661,6 @@ void GraphicsWindow::OnFrameDisplayed() {
                 // Composite runs on the GPU thread, so its owner CPU clock is valid here.
                 Eden::Performance::ReportGpuThread(frame_total);
 #endif
-                std::fflush(stdout);
                 frame_sample_start = now;
                 frame_sample_count = 0;
                 frame_sample_worst = 0;
